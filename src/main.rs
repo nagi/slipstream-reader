@@ -9,7 +9,10 @@
 //! - Super+I brings out the chapters on the left and the two colour sliders on the right, and
 //!   puts them away again.
 //! - ← and → go a chapter back or on; reading past the end of one goes on into the next.
-//! - Ctrl+O opens another book. F11 leaves full screen and comes back.
+//! - Ctrl+O opens another book.
+//!
+//! It is always full screen. The page and the text are in the desktop's theme, and change with
+//! it; a slider moved takes that colour off the theme until "Follow theme" puts it back.
 //!
 //! `slipstream-reader BOOK.epub` opens that book, in the window already open if there is one.
 //! With no book it opens the last one, where you left it.
@@ -17,6 +20,7 @@
 mod book;
 mod memory;
 mod palette;
+mod theme;
 
 use std::{
     cell::{Cell, RefCell},
@@ -80,7 +84,16 @@ struct Reader {
     colours_panel: gtk::Revealer,
     list: gtk::ListBox,
     zoom_label: gtk::Label,
+    page_scale: gtk::Scale,
+    text_scale: gtk::Scale,
+    follow_theme: gtk::Button,
     chrome: gtk::CssProvider,
+    /// The desktop's colours, as last read.
+    theme: Cell<theme::Theme>,
+    /// The sliders are being moved to match the theme, not by hand.
+    syncing: Cell<bool>,
+    theme_pending: Cell<bool>,
+    watching: RefCell<Vec<gio::FileMonitor>>,
     /// Shared with the scheme handler, which serves the page from it.
     book: Rc<RefCell<Option<Rc<Book>>>>,
     path: RefCell<Option<PathBuf>>,
@@ -162,9 +175,14 @@ impl Reader {
             .css_classes(["panel", "left"])
             .build();
 
-        let page_scale = colour_scale("page", memory.page);
-        let text_scale = colour_scale("text", memory.text);
+        let page_scale = colour_scale("page");
+        let text_scale = colour_scale("text");
         let zoom_label = gtk::Label::builder().css_classes(["zoom"]).build();
+        let follow_theme = gtk::Button::builder()
+            .label("Follow theme")
+            .css_classes(["follow"])
+            .halign(gtk::Align::Center)
+            .build();
         let sliders = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(18)
@@ -182,6 +200,7 @@ impl Reader {
             .margin_end(20)
             .build();
         colours.append(&sliders);
+        colours.append(&follow_theme);
         colours.append(&zoom_label);
         let colours_panel = gtk::Revealer::builder()
             .child(&colours)
@@ -222,7 +241,14 @@ impl Reader {
             colours_panel,
             list,
             zoom_label,
+            page_scale,
+            text_scale,
+            follow_theme,
             chrome,
+            theme: Cell::new(theme::current()),
+            syncing: Cell::new(false),
+            theme_pending: Cell::new(false),
+            watching: RefCell::new(Vec::new()),
             book,
             path: RefCell::new(None),
             chapter: Cell::new(0),
@@ -235,29 +261,50 @@ impl Reader {
             pointer_rest: RefCell::new(None),
             zoom_start: Cell::new(1.0),
         });
-        reader.connect(&page_scale, &text_scale);
+        reader.connect();
+        reader.sync_sliders();
         reader.recolour();
+        let weak = Rc::downgrade(&reader);
+        *reader.watching.borrow_mut() = theme::watch(move || {
+            if let Some(reader) = weak.upgrade() {
+                reader.theme_changed_soon();
+            }
+        });
         reader.show_zoom();
         reader
     }
 
-    fn connect(self: &Rc<Self>, page_scale: &gtk::Scale, text_scale: &gtk::Scale) {
+    fn connect(self: &Rc<Self>) {
         let weak = Rc::downgrade(self);
 
         let w = weak.clone();
-        page_scale.connect_value_changed(move |scale| {
-            if let Some(reader) = w.upgrade() {
-                reader.memory.borrow_mut().page = scale.value();
-                reader.recolour();
-                reader.save_soon();
+        self.page_scale.connect_value_changed(move |scale| {
+            if let Some(reader) = w.upgrade()
+                && !reader.syncing.get()
+            {
+                reader.memory.borrow_mut().page_choice = Some(scale.value());
+                reader.chosen();
             }
         });
         let w = weak.clone();
-        text_scale.connect_value_changed(move |scale| {
+        self.text_scale.connect_value_changed(move |scale| {
+            if let Some(reader) = w.upgrade()
+                && !reader.syncing.get()
+            {
+                reader.memory.borrow_mut().text_choice = Some(scale.value());
+                reader.chosen();
+            }
+        });
+        let w = weak.clone();
+        self.follow_theme.connect_clicked(move |_| {
             if let Some(reader) = w.upgrade() {
-                reader.memory.borrow_mut().text = scale.value();
-                reader.recolour();
-                reader.save_soon();
+                {
+                    let mut memory = reader.memory.borrow_mut();
+                    memory.page_choice = None;
+                    memory.text_choice = None;
+                }
+                reader.sync_sliders();
+                reader.chosen();
             }
         });
 
@@ -637,14 +684,6 @@ impl Reader {
             }
             return true;
         }
-        if plain && key == gdk::Key::F11 {
-            if self.window.is_fullscreen() {
-                self.window.unfullscreen();
-            } else {
-                self.window.fullscreen();
-            }
-            return true;
-        }
         if plain && key == gdk::Key::Escape && self.chapters_panel.reveals_child() {
             self.toggle_panels();
             return true;
@@ -723,12 +762,64 @@ impl Reader {
 
     // Colours.
 
-    /// The page, its text and the panels in the sliders' two colours.
-    fn recolour(&self) {
+    /// A slider moved by hand, or the theme followed again.
+    fn chosen(&self) {
+        self.recolour();
+        self.save_soon();
+    }
+
+    /// The theme's files changed: read again once they've settled, since a theme being set
+    /// writes several.
+    fn theme_changed_soon(&self) {
+        if self.theme_pending.replace(true) {
+            return;
+        }
+        glib::timeout_add_local_once(Duration::from_millis(300), || {
+            if let Some(reader) = READER.with(|reader| reader.borrow().clone()) {
+                reader.theme_pending.set(false);
+                let theme = theme::current();
+                if theme != reader.theme.get() {
+                    reader.theme.set(theme);
+                    reader.sync_sliders();
+                    reader.recolour();
+                }
+            }
+        });
+    }
+
+    /// Each slider where its colour is: the one chosen, or the nearest to the theme's.
+    fn sync_sliders(&self) {
+        let theme = self.theme.get();
         let (page, text) = {
             let memory = self.memory.borrow();
-            (palette::at(memory.page), palette::at(memory.text))
+            (memory.page_choice, memory.text_choice)
         };
+        self.syncing.set(true);
+        self.page_scale
+            .set_value(page.unwrap_or_else(|| palette::nearest(theme.page)));
+        self.text_scale
+            .set_value(text.unwrap_or_else(|| palette::nearest(theme.text)));
+        self.syncing.set(false);
+    }
+
+    /// The page's and the text's colours: the theme's, or the sliders' where they were moved.
+    fn colours(&self) -> (palette::Rgb, palette::Rgb) {
+        let theme = self.theme.get();
+        let memory = self.memory.borrow();
+        (
+            memory.page_choice.map_or(theme.page, palette::at),
+            memory.text_choice.map_or(theme.text, palette::at),
+        )
+    }
+
+    /// The page, its text and the panels in the two colours.
+    fn recolour(&self) {
+        let (page, text) = self.colours();
+        {
+            let memory = self.memory.borrow();
+            self.follow_theme
+                .set_visible(memory.page_choice.is_some() || memory.text_choice.is_some());
+        }
         self.content.remove_all_style_sheets();
         self.content.add_style_sheet(&webkit6::UserStyleSheet::new(
             &page_css(page, text),
@@ -741,7 +832,8 @@ impl Reader {
             gdk::RGBA::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0)
         };
         self.view.set_background_color(&rgba(page));
-        self.chrome.load_from_string(&chrome_css(page, text));
+        self.chrome
+            .load_from_string(&chrome_css(page, text, self.theme.get().accent));
     }
 
     /// Shown in place of a book: why there isn't one, and what to do.
@@ -849,11 +941,10 @@ fn well_formed(bytes: &[u8]) -> bool {
 }
 
 /// A vertical slider along the run of colours, light at the top.
-fn colour_scale(name: &str, value: f64) -> gtk::Scale {
+fn colour_scale(name: &str) -> gtk::Scale {
     let scale = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
     scale.set_inverted(true);
     scale.set_draw_value(false);
-    scale.set_value(value);
     scale.set_vexpand(true);
     scale.add_css_class("colour");
     scale.add_css_class(name);
@@ -889,10 +980,12 @@ img, svg, video {{ max-width: 100% !important; height: auto !important; }}
 }
 
 /// The panels a shade off the page, in the same text colour, so the screen stays one surface.
-fn chrome_css(page: palette::Rgb, text: palette::Rgb) -> String {
+/// The chapter you're in is marked in the theme's accent.
+fn chrome_css(page: palette::Rgb, text: palette::Rgb, accent: palette::Rgb) -> String {
     let panel = palette::hex(palette::mix(page, text, 0.05));
     let edge = palette::hex(palette::mix(page, text, 0.14));
-    let chosen = palette::hex(palette::mix(page, text, 0.13));
+    let chosen = palette::hex(palette::mix(page, accent, 0.16));
+    let accent_hex = palette::hex(accent);
     let hover = palette::hex(palette::mix(page, text, 0.08));
     let page_hex = palette::hex(page);
     let text_hex = palette::hex(text);
@@ -906,7 +999,10 @@ fn chrome_css(page: palette::Rgb, text: palette::Rgb) -> String {
 .chapters {{ background: transparent; padding: 24px 0; }}
 .chapters row {{ color: {quiet}; border-radius: 0; }}
 .chapters row:hover {{ background: {hover}; }}
-.chapters row:selected {{ background: {chosen}; color: {text_hex}; }}
+.chapters row:selected {{ background: {chosen}; color: {text_hex};
+  box-shadow: inset 3px 0 {accent_hex}; }}
+button.follow {{ background: {chosen}; color: {text_hex}; border: 1px solid {edge};
+  box-shadow: none; padding: 4px 12px; }}
 .chapters label.top {{ font-weight: 600; }}
 scale.colour trough {{ min-width: 18px; border-radius: 9px; background-image: {gradient};
   border: 1px solid {edge}; }}

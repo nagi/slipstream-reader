@@ -18,9 +18,10 @@ pub const ZOOM_MAX: f64 = 4.0;
 pub struct Memory {
     pub last: Option<PathBuf>,
     pub zoom: f64,
-    /// Where each slider is along the run of colours (`palette::at`).
-    pub page: f64,
-    pub text: f64,
+    /// Where each slider was moved to along the run of colours (`palette::at`), or `None` while
+    /// that colour follows the desktop's theme.
+    pub page_choice: Option<f64>,
+    pub text_choice: Option<f64>,
     pub panels: bool,
     /// Where you were in each book, by its path.
     pub places: BTreeMap<String, Place>,
@@ -38,8 +39,8 @@ impl Default for Memory {
         Self {
             last: None,
             zoom: 1.0,
-            page: crate::palette::PAGE,
-            text: crate::palette::TEXT,
+            page_choice: None,
+            text_choice: None,
             panels: false,
             places: BTreeMap::new(),
         }
@@ -84,13 +85,14 @@ impl Memory {
                 default
             }
         };
+        let choice = |value: Option<f64>| value.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0));
         self.zoom = if self.zoom.is_finite() {
             self.zoom.clamp(ZOOM_MIN, ZOOM_MAX)
         } else {
             1.0
         };
-        self.page = unit(self.page, crate::palette::PAGE);
-        self.text = unit(self.text, crate::palette::TEXT);
+        self.page_choice = choice(self.page_choice);
+        self.text_choice = choice(self.text_choice);
         for place in self.places.values_mut() {
             place.fraction = unit(place.fraction, 0.0);
         }
@@ -153,14 +155,22 @@ mod tests {
         let path = scratch("wild.json");
         std::fs::write(
             &path,
-            r#"{"zoom": 40, "page": -2, "places": {"/b.epub": {"chapter": 1, "fraction": 9}}}"#,
+            r#"{"zoom": 40, "page_choice": -2, "places": {"/b.epub": {"chapter": 1, "fraction": 9}}}"#,
         )
         .unwrap();
         let memory = Memory::read(&path);
         assert_eq!(memory.zoom, ZOOM_MAX);
-        assert_eq!(memory.page, 0.0);
-        assert_eq!(memory.text, crate::palette::TEXT);
+        assert_eq!(memory.page_choice, Some(0.0));
+        assert_eq!(memory.text_choice, None);
         assert_eq!(memory.places["/b.epub"].fraction, 1.0);
+    }
+
+    #[test]
+    fn colours_from_before_the_theme_was_followed_are_let_go() {
+        let path = scratch("old.json");
+        std::fs::write(&path, r#"{"page": 0.85, "text": 0.12}"#).unwrap();
+        let memory = Memory::read(&path);
+        assert_eq!((memory.page_choice, memory.text_choice), (None, None));
     }
 
     #[test]

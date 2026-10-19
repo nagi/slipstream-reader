@@ -18,11 +18,6 @@ const STOPS: [(f64, Rgb); 10] = [
     (1.00, [0xff, 0xff, 0xff]),
 ];
 
-/// The page's colour to begin with: between sepia paper and cream.
-pub const PAGE: f64 = 0.85;
-/// The text's: nearly the night blue.
-pub const TEXT: f64 = 0.12;
-
 /// The colour at `at` along the run, clamped to its ends.
 pub fn at(at: f64) -> Rgb {
     let at = if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.0 };
@@ -36,6 +31,21 @@ pub fn at(at: f64) -> Rgb {
     let (from_at, from) = STOPS[after - 1];
     let (to_at, to) = STOPS[after];
     mix(from, to, (at - from_at) / (to_at - from_at))
+}
+
+/// The point along the run whose colour is closest to `colour`: where a slider sits while the
+/// reader follows the theme.
+pub fn nearest(colour: Rgb) -> f64 {
+    const STEPS: u32 = 400;
+    let distance = |other: Rgb| -> i32 {
+        (0..3)
+            .map(|i| (colour[i] as i32 - other[i] as i32).pow(2))
+            .sum()
+    };
+    (0..=STEPS)
+        .map(|step| step as f64 / STEPS as f64)
+        .min_by_key(|point| distance(at(*point)))
+        .unwrap_or(0.0)
 }
 
 /// `from` taken `amount` of the way to `to`.
@@ -104,11 +114,12 @@ mod tests {
     }
 
     #[test]
-    fn the_defaults_are_easy_to_read() {
-        let page = at(PAGE);
-        let text = at(TEXT);
-        let gap: i32 = (0..3).map(|i| page[i] as i32 - text[i] as i32).sum();
-        assert!(gap > 3 * 180, "too little contrast: {page:?} on {text:?}");
+    fn the_nearest_point_finds_a_colour_on_the_run() {
+        assert_eq!(nearest([0, 0, 0]), 0.0);
+        assert_eq!(nearest([255, 255, 255]), 1.0);
+        assert!((nearest(at(0.8)) - 0.8).abs() < 0.01);
+        // A theme's dark grey lands near the dark end.
+        assert!(nearest([0x1a, 0x1b, 0x26]) < 0.2);
     }
 
     #[test]
