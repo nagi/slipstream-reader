@@ -9,15 +9,17 @@
 //! - Super+I brings out the chapters on the left and the two colour sliders on the right, and
 //!   puts them away again.
 //! - ← and → go a chapter back or on; reading past the end of one goes on into the next.
-//! - Ctrl+O opens another book.
+//! - Ctrl+O shows the library: every book in `~/Dropbox/Books`, by its cover. Enter or a click
+//!   opens one; Esc goes back to the book you were reading.
 //!
 //! It is always full screen. The page and the text are in the desktop's theme, and change with
 //! it; a slider moved takes that colour off the theme until "Follow theme" puts it back.
 //!
 //! `slipstream-reader BOOK.epub` opens that book, in the window already open if there is one.
-//! With no book it opens the last one, where you left it.
+//! With no book it opens the last one, where you left it, or the library when there isn't one.
 
 mod book;
+mod library;
 mod memory;
 mod palette;
 mod theme;
@@ -77,6 +79,16 @@ thread_local! {
 
 struct Reader {
     window: gtk::ApplicationWindow,
+    /// The library or the book.
+    stack: gtk::Stack,
+    shelf: gtk::FlowBox,
+    shelf_count: gtk::Label,
+    shelf_empty: gtk::Label,
+    library_button: gtk::Button,
+    /// The books on the shelf as last shown, in order, and their cards.
+    cards: RefCell<Vec<Card>>,
+    /// Counts each filling of the shelf, so covers still coming for an old one are dropped.
+    filling: Cell<u64>,
     view: webkit6::WebView,
     content: webkit6::UserContentManager,
     chapters_panel: gtk::Revealer,
@@ -168,8 +180,18 @@ impl Reader {
             .width_request(320)
             .vexpand(true)
             .build();
+        let library_button = gtk::Button::builder()
+            .label("Library")
+            .css_classes(["to-library"])
+            .halign(gtk::Align::Start)
+            .margin_top(20)
+            .margin_start(16)
+            .build();
+        let chapters_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        chapters_column.append(&library_button);
+        chapters_column.append(&chapters_scroll);
         let chapters_panel = gtk::Revealer::builder()
-            .child(&chapters_scroll)
+            .child(&chapters_column)
             .transition_type(gtk::RevealerTransitionType::SlideRight)
             .reveal_child(memory.panels)
             .css_classes(["panel", "left"])
@@ -214,12 +236,71 @@ impl Reader {
         layout.append(&view);
         layout.append(&colours_panel);
 
+        let shelf = gtk::FlowBox::builder()
+            .selection_mode(gtk::SelectionMode::Single)
+            .activate_on_single_click(true)
+            .homogeneous(true)
+            .min_children_per_line(2)
+            .max_children_per_line(12)
+            .column_spacing(18)
+            .row_spacing(28)
+            .valign(gtk::Align::Start)
+            .css_classes(["shelf"])
+            .build();
+        let shelf_count = gtk::Label::builder()
+            .css_classes(["caption"])
+            .halign(gtk::Align::Start)
+            .build();
+        let shelf_empty = gtk::Label::builder()
+            .label(format!(
+                "No books yet. EPUBs put in {} show up here.",
+                library::dir().display()
+            ))
+            .css_classes(["caption"])
+            .wrap(true)
+            .visible(false)
+            .build();
+        let heading = gtk::Label::builder()
+            .label("Library")
+            .css_classes(["library-title"])
+            .halign(gtk::Align::Start)
+            .build();
+        let head = gtk::Box::builder()
+            .orientation(gtk::Orientation::Horizontal)
+            .spacing(16)
+            .build();
+        head.append(&heading);
+        head.append(&shelf_count);
+        let library_column = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(28)
+            .margin_top(48)
+            .margin_bottom(64)
+            .margin_start(64)
+            .margin_end(64)
+            .build();
+        library_column.append(&head);
+        library_column.append(&shelf_empty);
+        library_column.append(&shelf);
+        let library_page = gtk::ScrolledWindow::builder()
+            .child(&library_column)
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .css_classes(["library"])
+            .build();
+
+        let stack = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .transition_duration(150)
+            .build();
+        stack.add_named(&layout, Some("book"));
+        stack.add_named(&library_page, Some("library"));
+
         let window = gtk::ApplicationWindow::builder()
             .application(app)
             .title("Reading")
             .default_width(1200)
             .default_height(900)
-            .child(&layout)
+            .child(&stack)
             .build();
         window.fullscreen();
 
@@ -234,6 +315,13 @@ impl Reader {
 
         let reader = Rc::new(Reader {
             window,
+            stack,
+            shelf,
+            shelf_count,
+            shelf_empty,
+            library_button,
+            cards: RefCell::new(Vec::new()),
+            filling: Cell::new(0),
             view,
             content,
             chapters_panel,
@@ -305,6 +393,26 @@ impl Reader {
                 }
                 reader.sync_sliders();
                 reader.chosen();
+            }
+        });
+
+        let w = weak.clone();
+        self.shelf.connect_child_activated(move |_, child| {
+            if let Some(reader) = w.upgrade() {
+                let path = reader
+                    .cards
+                    .borrow()
+                    .get(child.index() as usize)
+                    .map(|card| card.path.clone());
+                if let Some(path) = path {
+                    reader.open(&path);
+                }
+            }
+        });
+        let w = weak.clone();
+        self.library_button.connect_clicked(move |_| {
+            if let Some(reader) = w.upgrade() {
+                reader.show_library();
             }
         });
 
@@ -419,37 +527,104 @@ impl Reader {
 
     // Opening books.
 
-    /// The last book, where it was left, or a file chooser when there isn't one.
+    /// The last book, where it was left, or the library when there isn't one.
     fn open_last_or_ask(self: &Rc<Self>) {
         let last = self.memory.borrow().last.clone();
         match last.filter(|path| path.exists()) {
             Some(path) => self.open(&path),
+            None => self.show_library(),
+        }
+    }
+
+    // The library.
+
+    fn in_library(&self) -> bool {
+        self.stack.visible_child_name().as_deref() == Some("library")
+    }
+
+    /// The shelf, filled again if the books in the folder have changed, with the book being read
+    /// picked out.
+    fn show_library(self: &Rc<Self>) {
+        self.save_now();
+        let found = library::scan(&library::dir());
+        let same = {
+            let cards = self.cards.borrow();
+            cards.len() == found.len()
+                && cards
+                    .iter()
+                    .zip(&found)
+                    .all(|(card, path)| card.path == *path)
+        };
+        if !same {
+            self.fill_shelf(found);
+        }
+        self.stack.set_visible_child_name("library");
+        self.view.set_cursor(None);
+        let current = self.path.borrow().clone();
+        let at = current.and_then(|path| {
+            self.cards
+                .borrow()
+                .iter()
+                .position(|card| card.path == path)
+        });
+        match at.and_then(|at| self.shelf.child_at_index(at as i32)) {
+            Some(child) => {
+                self.shelf.select_child(&child);
+                child.grab_focus();
+            }
             None => {
-                self.show_note("No book open", "Ctrl+O opens one.");
-                self.ask_for_book();
+                self.shelf.unselect_all();
+                if let Some(first) = self.shelf.child_at_index(0) {
+                    first.grab_focus();
+                }
             }
         }
     }
 
-    fn ask_for_book(self: &Rc<Self>) {
-        let filter = gtk::FileFilter::new();
-        filter.set_name(Some("EPUB books"));
-        filter.add_mime_type("application/epub+zip");
-        filter.add_suffix("epub");
-        let filters = gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
-        let dialog = gtk::FileDialog::builder()
-            .title("Open a book")
-            .filters(&filters)
-            .default_filter(&filter)
-            .modal(true)
-            .build();
+    /// Back to the book, if there is one.
+    fn show_book(&self) {
+        if self.book.borrow().is_none() {
+            return;
+        }
+        self.stack.set_visible_child_name("book");
+        self.view.grab_focus();
+    }
+
+    /// A card for each book, named from its file at first; titles, authors and covers follow as
+    /// each book is read, off the main thread.
+    fn fill_shelf(self: &Rc<Self>, found: Vec<PathBuf>) {
+        while let Some(child) = self.shelf.first_child() {
+            self.shelf.remove(&child);
+        }
+        let cards: Vec<Card> = found.iter().map(|path| Card::new(path)).collect();
+        for card in &cards {
+            self.shelf.append(&card.widget);
+        }
+        let count = cards.len();
+        self.shelf_count.set_label(&match count {
+            1 => "1 book".to_string(),
+            n => format!("{n} books"),
+        });
+        self.shelf_empty.set_visible(count == 0);
+        *self.cards.borrow_mut() = cards;
+        let filling = self.filling.get() + 1;
+        self.filling.set(filling);
         let weak = Rc::downgrade(self);
-        dialog.open(Some(&self.window), gio::Cancellable::NONE, move |chosen| {
-            if let (Some(reader), Ok(file)) = (weak.upgrade(), chosen)
-                && let Some(path) = file.path()
-            {
-                reader.open(&path);
+        glib::spawn_future_local(async move {
+            for (at, path) in found.into_iter().enumerate() {
+                let Ok(shelved) = gio::spawn_blocking(move || library::describe(&path)).await
+                else {
+                    continue;
+                };
+                let Some(reader) = weak.upgrade() else {
+                    return;
+                };
+                if reader.filling.get() != filling {
+                    return;
+                }
+                if let Some(card) = reader.cards.borrow().get(at) {
+                    card.show(&shelved);
+                }
             }
         });
     }
@@ -474,6 +649,8 @@ impl Reader {
             memory.place(path).unwrap_or_default()
         };
         let chapter = place.chapter.min(opened.chapters.len() - 1);
+        self.stack.set_visible_child_name("book");
+        self.view.grab_focus();
         self.load_chapter(chapter, Some(place.fraction));
         self.save_soon();
     }
@@ -665,6 +842,20 @@ impl Reader {
         let ctrl = state == gdk::ModifierType::CONTROL_MASK;
         let plain = state.is_empty();
         let shift = state == gdk::ModifierType::SHIFT_MASK;
+        if self.in_library() {
+            return match key {
+                gdk::Key::Escape if plain => {
+                    self.show_book();
+                    true
+                }
+                gdk::Key::o if ctrl => {
+                    self.show_book();
+                    true
+                }
+                // The shelf's own arrows and Enter.
+                _ => false,
+            };
+        }
         if state.contains(gdk::ModifierType::SUPER_MASK) && key.to_lower() == gdk::Key::i {
             self.toggle_panels();
             return true;
@@ -676,7 +867,7 @@ impl Reader {
                     self.zoom_by(1.0 / ZOOM_STEP)
                 }
                 gdk::Key::_0 | gdk::Key::KP_0 => self.zoom_to(1.0),
-                gdk::Key::o => self.ask_for_book(),
+                gdk::Key::o => self.show_library(),
                 gdk::Key::Page_Down => self.step_chapter(true),
                 gdk::Key::Page_Up => self.step_chapter(false),
                 _ => return false,
@@ -910,6 +1101,169 @@ impl Reader {
     }
 }
 
+/// The size covers are shown at on the shelf, in logical pixels.
+const COVER_W: i32 = 168;
+const COVER_H: i32 = 252;
+
+/// One book on the shelf: its cover, or a plain card with its title where it has none, and its
+/// title and author beneath.
+struct Card {
+    path: PathBuf,
+    widget: gtk::Box,
+    cover: gtk::DrawingArea,
+    picture: Rc<RefCell<Option<gdk::gdk_pixbuf::Pixbuf>>>,
+    /// The title on the plain card, hidden once there is a cover.
+    plain: gtk::Label,
+    title: gtk::Label,
+    author: gtk::Label,
+}
+
+impl Card {
+    fn new(path: &Path) -> Card {
+        let name = library::tidy_name(path);
+        let picture: Rc<RefCell<Option<gdk::gdk_pixbuf::Pixbuf>>> = Rc::default();
+        let cover = gtk::DrawingArea::builder()
+            .content_width(COVER_W)
+            .content_height(COVER_H)
+            .css_classes(["cover"])
+            .build();
+        let painting = picture.clone();
+        cover.set_draw_func(move |area, cr, w, h| paint_cover(area, cr, w, h, &painting.borrow()));
+        let plain = gtk::Label::builder()
+            .label(&name)
+            .wrap(true)
+            .justify(gtk::Justification::Center)
+            .max_width_chars(14)
+            .lines(6)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .margin_start(14)
+            .margin_end(14)
+            .css_classes(["plain-title"])
+            .build();
+        let framed = gtk::Overlay::builder()
+            .child(&cover)
+            .halign(gtk::Align::Center)
+            .build();
+        framed.add_overlay(&plain);
+        let title = gtk::Label::builder()
+            .label(&name)
+            .wrap(true)
+            .lines(2)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(18)
+            .width_request(COVER_W)
+            .xalign(0.0)
+            .css_classes(["book-title"])
+            .build();
+        let author = gtk::Label::builder()
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .max_width_chars(18)
+            .xalign(0.0)
+            .visible(false)
+            .css_classes(["book-author"])
+            .build();
+        let widget = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(6)
+            .halign(gtk::Align::Center)
+            .build();
+        widget.append(&framed);
+        widget.append(&title);
+        widget.append(&author);
+        Card {
+            path: path.to_path_buf(),
+            widget,
+            cover,
+            picture,
+            plain,
+            title,
+            author,
+        }
+    }
+
+    /// What the book says of itself, once it has been read.
+    fn show(&self, shelved: &library::Shelved) {
+        self.title.set_label(&shelved.title);
+        self.plain.set_label(&shelved.title);
+        if let Some(author) = &shelved.author {
+            self.author.set_label(author);
+            self.author.set_visible(true);
+        }
+        let picture = shelved
+            .cover
+            .as_ref()
+            .and_then(|cover| gdk::gdk_pixbuf::Pixbuf::from_file(cover).ok());
+        self.plain.set_visible(picture.is_none());
+        *self.picture.borrow_mut() = picture;
+        self.cover.queue_draw();
+    }
+}
+
+/// A cover filling its card, cut to fit and with rounded corners; with none, a plain card a shade
+/// off the page, which its title is written over.
+fn paint_cover(
+    area: &gtk::DrawingArea,
+    cr: &gtk::cairo::Context,
+    w: i32,
+    h: i32,
+    picture: &Option<gdk::gdk_pixbuf::Pixbuf>,
+) {
+    let (w, h) = (w as f64, h as f64);
+    let radius = 6.0;
+    cr.new_sub_path();
+    cr.arc(
+        w - radius,
+        radius,
+        radius,
+        -std::f64::consts::FRAC_PI_2,
+        0.0,
+    );
+    cr.arc(
+        w - radius,
+        h - radius,
+        radius,
+        0.0,
+        std::f64::consts::FRAC_PI_2,
+    );
+    cr.arc(
+        radius,
+        h - radius,
+        radius,
+        std::f64::consts::FRAC_PI_2,
+        std::f64::consts::PI,
+    );
+    cr.arc(
+        radius,
+        radius,
+        radius,
+        std::f64::consts::PI,
+        1.5 * std::f64::consts::PI,
+    );
+    cr.close_path();
+    cr.clip();
+    match picture {
+        Some(pixbuf) => {
+            let (pw, ph) = (pixbuf.width() as f64, pixbuf.height() as f64);
+            let scale = (w / pw).max(h / ph);
+            cr.translate((w - pw * scale) / 2.0, (h - ph * scale) / 2.0);
+            cr.scale(scale, scale);
+            cr.set_source_pixbuf(pixbuf, 0.0, 0.0);
+            cr.source().set_filter(gtk::cairo::Filter::Good);
+            let _ = cr.paint();
+        }
+        None => {
+            let ink = area.color();
+            cr.set_source_rgba(
+                ink.red() as f64,
+                ink.green() as f64,
+                ink.blue() as f64,
+                0.08,
+            );
+            let _ = cr.paint();
+        }
+    }
+}
+
 /// A file of the book, for the page.
 fn serve(book: &Rc<RefCell<Option<Rc<Book>>>>, request: &webkit6::URISchemeRequest) {
     let path = request
@@ -1006,6 +1360,20 @@ fn chrome_css(page: palette::Rgb, text: palette::Rgb, accent: palette::Rgb) -> S
     let gradient = palette::gradient();
     format!(
         "window {{ background: {page_hex}; color: {text_hex}; }}
+.library {{ background: {page_hex}; }}
+.library-title {{ font-size: 1.8em; font-weight: 300; }}
+.shelf {{ background: transparent; }}
+.shelf flowboxchild {{ padding: 12px; border-radius: 10px; outline: none; }}
+.shelf flowboxchild:hover {{ background: {hover}; }}
+.shelf flowboxchild:focus-visible {{ box-shadow: inset 0 0 0 2px {edge}; }}
+.shelf flowboxchild:selected {{ background: {chosen}; box-shadow: inset 0 0 0 2px {accent_hex}; }}
+.cover {{ box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35); border-radius: 6px; }}
+.plain-title {{ font-size: 1.05em; }}
+.book-title {{ font-weight: 600; }}
+.book-author {{ color: {quiet}; font-size: 0.9em; }}
+button.to-library {{ background: none; border: none; box-shadow: none; color: {quiet};
+  padding: 4px 8px; }}
+button.to-library:hover {{ color: {text_hex}; background: {hover}; }}
 .panel > * {{ background: {panel}; color: {text_hex}; }}
 .panel.left > * {{ border-right: 1px solid {edge}; }}
 .panel.right > * {{ border-left: 1px solid {edge}; }}
