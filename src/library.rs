@@ -181,6 +181,16 @@ pub fn tidy_name(path: &Path) -> String {
     name
 }
 
+/// Whether a book matches what's typed into the library's filter: every word of `query` is
+/// somewhere in its title, author or file name, ignoring case.
+pub fn matches(query: &str, book: &[&str]) -> bool {
+    let book = book.join(" ").to_lowercase();
+    query
+        .to_lowercase()
+        .split_whitespace()
+        .all(|word| book.contains(word))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +240,16 @@ mod tests {
         let shelved = describe(&path);
         assert_eq!(shelved.title, "Broken Money (Lyn Alden)");
         assert_eq!((shelved.author, shelved.cover), (None, None));
+    }
+
+    #[test]
+    fn every_typed_word_is_somewhere_in_the_title_author_or_file() {
+        let book = ["The Colour of Magic", "Terry Pratchett", "Discworld 01"];
+        assert!(matches("", &book), "nothing typed shows every book");
+        assert!(matches("colour", &book));
+        assert!(matches("PRATCH magic", &book), "any case, any order");
+        assert!(matches("discworld", &book), "the file name too");
+        assert!(!matches("magic feist", &book));
     }
 
     #[test]

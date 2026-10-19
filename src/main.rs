@@ -9,7 +9,8 @@
 //! - Super+I brings out the chapters on the left and the two colour sliders on the right, and
 //!   puts them away again.
 //! - ← and → go a chapter back or on; reading past the end of one goes on into the next.
-//! - Ctrl+O shows the library: every book in `~/Dropbox/Books`, by its cover. Enter or a click
+//! - Ctrl+O shows the library: every book in `~/Dropbox/Books`, by its cover. Typing narrows it
+//!   down by title, author or file name. Enter or a click
 //!   opens one; Esc goes back to the book you were reading.
 //!
 //! It is always full screen. The page and the text are in the desktop's theme, and change with
@@ -84,6 +85,8 @@ struct Reader {
     shelf: gtk::FlowBox,
     shelf_count: gtk::Label,
     shelf_empty: gtk::Label,
+    /// What's typed to narrow the shelf down: typing anywhere in the library starts it.
+    filter: gtk::SearchEntry,
     library_button: gtk::Button,
     /// The books on the shelf as last shown, in order, and their cards.
     cards: RefCell<Vec<Card>>,
@@ -269,8 +272,16 @@ impl Reader {
             .orientation(gtk::Orientation::Horizontal)
             .spacing(16)
             .build();
+        let filter = gtk::SearchEntry::builder()
+            .placeholder_text("Type to find a book")
+            .hexpand(true)
+            .halign(gtk::Align::End)
+            .width_chars(28)
+            .css_classes(["filter"])
+            .build();
         head.append(&heading);
         head.append(&shelf_count);
+        head.append(&filter);
         let library_column = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(28)
@@ -319,6 +330,7 @@ impl Reader {
             shelf,
             shelf_count,
             shelf_empty,
+            filter,
             library_button,
             cards: RefCell::new(Vec::new()),
             filling: Cell::new(0),
@@ -396,6 +408,23 @@ impl Reader {
             }
         });
 
+        let w = weak.clone();
+        self.shelf.set_filter_func(move |child| {
+            w.upgrade()
+                .is_none_or(|reader| reader.shown_on_shelf(child))
+        });
+        let w = weak.clone();
+        self.filter.connect_search_changed(move |_| {
+            if let Some(reader) = w.upgrade() {
+                reader.filtered();
+            }
+        });
+        let w = weak.clone();
+        self.filter.connect_activate(move |_| {
+            if let Some(reader) = w.upgrade() {
+                reader.open_first_found();
+            }
+        });
         let w = weak.clone();
         self.shelf.connect_child_activated(move |_, child| {
             if let Some(reader) = w.upgrade() {
@@ -558,6 +587,7 @@ impl Reader {
         if !same {
             self.fill_shelf(found);
         }
+        self.filter.set_text("");
         self.stack.set_visible_child_name("library");
         self.view.set_cursor(None);
         let current = self.path.borrow().clone();
@@ -578,6 +608,117 @@ impl Reader {
                     first.grab_focus();
                 }
             }
+        }
+    }
+
+    /// Whether a card is shown with what's typed into the filter.
+    fn shown_on_shelf(&self, child: &gtk::FlowBoxChild) -> bool {
+        let query = self.filter.text();
+        if query.trim().is_empty() {
+            return true;
+        }
+        let cards = self.cards.borrow();
+        let Some(card) = cards.get(child.index() as usize) else {
+            return true;
+        };
+        let file = library::tidy_name(&card.path);
+        library::matches(&query, &[&card.title.label(), &card.author.label(), &file])
+    }
+
+    /// The cards still shown, in order.
+    fn found(&self) -> Vec<gtk::FlowBoxChild> {
+        (0..self.cards.borrow().len() as i32)
+            .filter_map(|at| self.shelf.child_at_index(at))
+            .filter(|child| child.is_child_visible())
+            .collect()
+    }
+
+    /// The filter changed: the shelf narrows to match, the first book left is picked out, and
+    /// the count says how many are left.
+    fn filtered(&self) {
+        self.shelf.invalidate_filter();
+        let total = self.cards.borrow().len();
+        let found = self.found();
+        let typed = !self.filter.text().trim().is_empty();
+        self.shelf_count.set_label(&match (typed, total) {
+            (true, _) => format!("{} of {total}", found.len()),
+            (false, 1) => "1 book".to_string(),
+            (false, n) => format!("{n} books"),
+        });
+        match found.first() {
+            Some(first) if typed => self.shelf.select_child(first),
+            _ if typed => self.shelf.unselect_all(),
+            _ => {}
+        }
+    }
+
+    /// Enter in the filter: the picked-out book, or the first one found.
+    fn open_first_found(self: &Rc<Self>) {
+        let chosen = self
+            .shelf
+            .selected_children()
+            .into_iter()
+            .find(|child| child.is_child_visible())
+            .or_else(|| self.found().into_iter().next());
+        let path = chosen.and_then(|child| {
+            self.cards
+                .borrow()
+                .get(child.index() as usize)
+                .map(|card| card.path.clone())
+        });
+        if let Some(path) = path {
+            self.open(&path);
+        }
+    }
+
+    /// A key in the library. Typing goes into the filter wherever the keyboard is.
+    fn library_key(self: &Rc<Self>, key: gdk::Key, plain: bool, ctrl: bool, shift: bool) -> bool {
+        let typing = self.filter.has_focus() || self.filter.focus_child().is_some();
+        let filtered = !self.filter.text().is_empty();
+        match key {
+            gdk::Key::Escape if plain && filtered => {
+                self.filter.set_text("");
+                if let Some(first) = self.found().first() {
+                    first.grab_focus();
+                }
+                true
+            }
+            gdk::Key::Escape if plain => {
+                self.show_book();
+                true
+            }
+            gdk::Key::o if ctrl => {
+                self.show_book();
+                true
+            }
+            // Down from the filter to the books found.
+            gdk::Key::Down if typing => {
+                let chosen = self.shelf.selected_children().into_iter().next();
+                if let Some(child) = chosen.or_else(|| self.found().into_iter().next()) {
+                    child.grab_focus();
+                }
+                true
+            }
+            gdk::Key::BackSpace if plain && !typing && filtered => {
+                let mut text = self.filter.text().to_string();
+                text.pop();
+                self.filter.set_text(&text);
+                true
+            }
+            _ if typing => false,
+            _ if plain || shift => match key.to_unicode() {
+                Some(ch) if !ch.is_control() && !(ch == ' ' && !filtered) => {
+                    let mut text = self.filter.text().to_string();
+                    text.push(ch);
+                    self.filter.set_text(&text);
+                    self.filter.grab_focus();
+                    self.filter.set_position(-1);
+                    true
+                }
+                // The shelf's own arrows and Enter.
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -624,6 +765,9 @@ impl Reader {
                 }
                 if let Some(card) = reader.cards.borrow().get(at) {
                     card.show(&shelved);
+                }
+                if !reader.filter.text().is_empty() {
+                    reader.filtered();
                 }
             }
         });
@@ -843,18 +987,7 @@ impl Reader {
         let plain = state.is_empty();
         let shift = state == gdk::ModifierType::SHIFT_MASK;
         if self.in_library() {
-            return match key {
-                gdk::Key::Escape if plain => {
-                    self.show_book();
-                    true
-                }
-                gdk::Key::o if ctrl => {
-                    self.show_book();
-                    true
-                }
-                // The shelf's own arrows and Enter.
-                _ => false,
-            };
+            return self.library_key(key, plain, ctrl, shift);
         }
         if state.contains(gdk::ModifierType::SUPER_MASK) && key.to_lower() == gdk::Key::i {
             self.toggle_panels();
@@ -1371,6 +1504,8 @@ fn chrome_css(page: palette::Rgb, text: palette::Rgb, accent: palette::Rgb) -> S
 .plain-title {{ font-size: 1.05em; }}
 .book-title {{ font-weight: 600; }}
 .book-author {{ color: {quiet}; font-size: 0.9em; }}
+entry.filter {{ background: {panel}; color: {text_hex}; border: 1px solid {edge}; box-shadow: none; }}
+entry.filter:focus-within {{ border-color: {accent_hex}; outline-color: {accent_hex}; }}
 button.to-library {{ background: none; border: none; box-shadow: none; color: {quiet};
   padding: 4px 8px; }}
 button.to-library:hover {{ color: {text_hex}; background: {hover}; }}
