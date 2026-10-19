@@ -176,7 +176,11 @@ fn percent_decoded(text: &str) -> String {
 }
 
 fn guess_media_type(path: &str) -> &'static str {
-    let extension = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    let extension = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     match extension.as_str() {
         "xhtml" | "xht" => "application/xhtml+xml",
         "html" | "htm" => "text/html",
@@ -280,10 +284,7 @@ mod tests {
             .iter()
             .map(|entry| (entry.label.as_str(), entry.depth))
             .collect();
-        assert_eq!(
-            labels,
-            [("Part One", 0), ("Beginning", 1), ("Part Two", 0)]
-        );
+        assert_eq!(labels, [("Part One", 0), ("Beginning", 1), ("Part Two", 0)]);
         assert_eq!(book.contents[1].fragment.as_deref(), Some("start"));
         assert_eq!(book.contents[2].chapter, Some(2));
     }

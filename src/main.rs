@@ -603,13 +603,8 @@ impl Reader {
             "(() => {{ const el = document.scrollingElement || document.documentElement; \
              window.scrollTo(0, {fraction} * Math.max(0, el.scrollHeight - window.innerHeight)); }})()"
         );
-        self.view.evaluate_javascript(
-            &script,
-            Some(WORLD),
-            None,
-            gio::Cancellable::NONE,
-            |_| {},
-        );
+        self.view
+            .evaluate_javascript(&script, Some(WORLD), None, gio::Cancellable::NONE, |_| {});
     }
 
     fn scrolled(&self, fraction: f64, top: bool, bottom: bool) {
@@ -638,7 +633,11 @@ impl Reader {
             .and_then(|request| request.uri())
             .map(|uri| uri.to_string())
             .unwrap_or_default();
-        let scheme = uri.split(':').next().unwrap_or_default().to_ascii_lowercase();
+        let scheme = uri
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
         match scheme.as_str() {
             book::SCHEME if kind == webkit6::PolicyDecisionType::NavigationAction => {
                 decision.use_();
@@ -690,8 +689,9 @@ impl Reader {
         }
         // The rest move through the book, and only while the page has the keyboard: in the
         // chapter list and on the sliders the arrows are theirs.
-        let on_page = gtk::prelude::GtkWindowExt::focus(&self.window)
-            .is_none_or(|focus| focus == *self.view.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&self.view));
+        let on_page = gtk::prelude::GtkWindowExt::focus(&self.window).is_none_or(|focus| {
+            focus == *self.view.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&self.view)
+        });
         if !on_page {
             return false;
         }
@@ -829,7 +829,12 @@ impl Reader {
             &[],
         ));
         let rgba = |c: palette::Rgb| {
-            gdk::RGBA::new(c[0] as f32 / 255.0, c[1] as f32 / 255.0, c[2] as f32 / 255.0, 1.0)
+            gdk::RGBA::new(
+                c[0] as f32 / 255.0,
+                c[1] as f32 / 255.0,
+                c[2] as f32 / 255.0,
+                1.0,
+            )
         };
         self.view.set_background_color(&rgba(page));
         self.chrome
@@ -907,7 +912,10 @@ impl Reader {
 
 /// A file of the book, for the page.
 fn serve(book: &Rc<RefCell<Option<Rc<Book>>>>, request: &webkit6::URISchemeRequest) {
-    let path = request.path().map(|path| path.to_string()).unwrap_or_default();
+    let path = request
+        .path()
+        .map(|path| path.to_string())
+        .unwrap_or_default();
     let found = book.borrow().as_ref().and_then(|book| book.read(&path));
     let Some((bytes, mut media)) = found else {
         let mut err = glib::Error::new(gio::IOErrorEnum::NotFound, "not in this book");
@@ -954,7 +962,12 @@ fn colour_scale(name: &str) -> gtk::Scale {
 fn labelled(scale: &gtk::Scale, label: &str) -> gtk::Box {
     let column = gtk::Box::new(gtk::Orientation::Vertical, 10);
     column.append(scale);
-    column.append(&gtk::Label::builder().label(label).css_classes(["caption"]).build());
+    column.append(
+        &gtk::Label::builder()
+            .label(label)
+            .css_classes(["caption"])
+            .build(),
+    );
     column
 }
 

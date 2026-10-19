@@ -20,7 +20,11 @@ const STOPS: [(f64, Rgb); 10] = [
 
 /// The colour at `at` along the run, clamped to its ends.
 pub fn at(at: f64) -> Rgb {
-    let at = if at.is_finite() { at.clamp(0.0, 1.0) } else { 0.0 };
+    let at = if at.is_finite() {
+        at.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     let after = STOPS
         .iter()
         .position(|(stop, _)| *stop >= at)
@@ -62,7 +66,10 @@ pub fn hex(colour: Rgb) -> String {
 
 /// The colour with an alpha, for CSS.
 pub fn rgba(colour: Rgb, alpha: f64) -> String {
-    format!("rgba({}, {}, {}, {alpha:.2})", colour[0], colour[1], colour[2])
+    format!(
+        "rgba({}, {}, {}, {alpha:.2})",
+        colour[0], colour[1], colour[2]
+    )
 }
 
 /// The whole run as a CSS gradient, darkest at the bottom, for a slider's track.

@@ -85,7 +85,8 @@ impl Memory {
                 default
             }
         };
-        let choice = |value: Option<f64>| value.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0));
+        let choice =
+            |value: Option<f64>| value.filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 1.0));
         self.zoom = if self.zoom.is_finite() {
             self.zoom.clamp(ZOOM_MIN, ZOOM_MAX)
         } else {
@@ -116,7 +117,8 @@ mod tests {
     use super::*;
 
     fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("slipstream-reader-memory-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("slipstream-reader-memory-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(name)
     }

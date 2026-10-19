@@ -55,14 +55,16 @@ pub fn watch(changed: impl Fn() + Clone + 'static) -> Vec<gio::FileMonitor> {
     // `omarchy theme set` moves the new theme into place and then writes its name, so the
     // folder is watched rather than a file in it.
     let folder = gio::File::for_path(slipstream_config::theme::current_dir());
-    if let Ok(monitor) = folder.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+    if let Ok(monitor) =
+        folder.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
     {
         let changed = changed.clone();
         monitor.connect_changed(move |_, _, _, _| changed());
         monitors.push(monitor);
     }
     let settings = gio::File::for_path(slipstream_config::path());
-    if let Ok(monitor) = settings.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE) {
+    if let Ok(monitor) = settings.monitor_file(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+    {
         monitor.connect_changed(move |_, _, _, _| changed());
         monitors.push(monitor);
     }
