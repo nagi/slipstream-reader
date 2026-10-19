@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Reading Mode
+GenericName=Book Reader
+Comment=Read EPUB books full screen, with nothing else on it
+Exec=slipstream-reader %f
+Icon=application-epub+zip
+Categories=Office;Viewer;GTK;
+Keywords=book;ebook;epub;reader;reading;
+MimeType=application/epub+zip;
+StartupNotify=true
