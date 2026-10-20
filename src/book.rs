@@ -8,6 +8,8 @@ use std::path::Path;
 
 use rbook::Epub;
 
+use crate::{book_fonts::BookFonts, fonts, obfuscation::Obfuscated};
+
 /// The scheme the page's files are served under, and the host every book is at.
 pub const SCHEME: &str = "epub";
 const ORIGIN: &str = "epub://book";
@@ -19,6 +21,10 @@ pub struct Book {
     pub chapters: Vec<String>,
     /// The table of contents, flattened: what the chapter list shows.
     pub contents: Vec<Entry>,
+    /// The fonts it names and carries.
+    pub fonts: BookFonts,
+    /// Its fonts that were scrambled, put back as they're served.
+    obfuscated: Obfuscated,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -88,22 +94,31 @@ impl Book {
                 })
                 .collect();
         }
+        let obfuscated = obfuscated_fonts(&epub);
+        let fonts = survey_fonts(&epub, &chapters, &obfuscated);
         Ok(Book {
             epub,
             title,
             chapters,
             contents,
+            fonts,
+            obfuscated,
         })
     }
 
-    /// The file at `path`, and its media type, as the page asked for it.
+    /// The file at `path`, and its media type, as the page asked for it. The reader's own fonts
+    /// are served beside the book's files.
     pub fn read(&self, path: &str) -> Option<(Vec<u8>, String)> {
+        if path.starts_with(fonts::PREFIX) {
+            return fonts::read(path);
+        }
         let decoded = percent_decoded(path);
-        let bytes = self
+        let mut bytes = self
             .epub
             .read_resource_bytes(path)
             .or_else(|_| self.epub.read_resource_bytes(decoded.as_str()))
             .ok()?;
+        self.obfuscated.restore(&decoded, &mut bytes);
         let media = self
             .epub
             .manifest()
@@ -134,6 +149,60 @@ impl Book {
     }
 }
 
+/// The book's scrambled fonts, from `META-INF/encryption.xml`, if it has one.
+fn obfuscated_fonts(epub: &Epub) -> Obfuscated {
+    let Ok(xml) = epub.read_resource_str("/META-INF/encryption.xml") else {
+        return Obfuscated::default();
+    };
+    let metadata = epub.metadata();
+    let unique = metadata.identifier().map(|id| id.value().to_string());
+    let all: Vec<String> = metadata
+        .identifiers()
+        .map(|id| id.value().to_string())
+        .collect();
+    Obfuscated::read(&xml, unique.as_deref(), &all)
+}
+
+/// How many chapters' own `<style>`s are looked through for fonts, as well as the stylesheets.
+const STYLED_CHAPTERS: usize = 12;
+
+/// What the book's stylesheets, and the styles in its first chapters, say about its fonts.
+fn survey_fonts(epub: &Epub, chapters: &[String], obfuscated: &Obfuscated) -> BookFonts {
+    let mut sheets: Vec<(String, String)> = epub
+        .manifest()
+        .styles()
+        .filter_map(|entry| {
+            let path = entry.href().path().as_str().to_string();
+            Some((path, entry.read_str().ok()?))
+        })
+        .collect();
+    for chapter in chapters.iter().take(STYLED_CHAPTERS) {
+        let Ok(page) = epub.read_resource_str(chapter.as_str()) else {
+            continue;
+        };
+        sheets.extend(style_elements(&page).map(|css| (chapter.clone(), css.to_string())));
+    }
+    crate::book_fonts::survey(&sheets, |path| {
+        let bytes = epub.read_resource_bytes(path).ok()?;
+        let mut head = bytes[..bytes.len().min(16)].to_vec();
+        obfuscated.restore(path, &mut head);
+        Some((head, obfuscated.scheme(path)))
+    })
+}
+
+/// The text of each `<style>` in a page.
+fn style_elements(page: &str) -> impl Iterator<Item = &str> {
+    let mut rest = page;
+    std::iter::from_fn(move || {
+        let start = rest.find("<style")?;
+        let open_end = start + rest[start..].find('>')? + 1;
+        let close = open_end + rest[open_end..].find("</style")?;
+        let css = &rest[open_end..close];
+        rest = &rest[close..];
+        Some(css)
+    })
+}
+
 /// The address the page loads `path` from.
 pub fn uri(path: &str, fragment: Option<&str>) -> String {
     let slash = if path.starts_with('/') { "" } else { "/" };
@@ -155,7 +224,7 @@ fn tidy(label: &str) -> String {
     label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn percent_decoded(text: &str) -> String {
+pub fn percent_decoded(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

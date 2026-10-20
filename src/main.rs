@@ -1,4 +1,5 @@
-//! Slipstream's reading mode (Super+R): an EPUB book, full screen, with nothing else on it.
+//! A reading mode for EPUB books: one book, full screen, with nothing else on it. It began as
+//! Slipstream's reading mode, and on a Slipstream desktop Super+R still opens it.
 //!
 //! The page is drawn by WebKit, the engine Foliate uses, from the book's own files, served from
 //! inside the book under `epub://book/`. The book's scripts never run and nothing is fetched from
@@ -6,12 +7,17 @@
 //!
 //! - Ctrl+= and Ctrl+-, Ctrl and the wheel, or a pinch make the text bigger or smaller; Ctrl+0
 //!   puts it back.
-//! - Super+I brings out the chapters on the left and the two colour sliders on the right, and
-//!   puts them away again.
+//! - Ctrl+I brings out the chapters on the left, and on the right the two colour sliders, the
+//!   font to read in and what the book says of its own fonts; and puts them away again.
 //! - ← and → go a chapter back or on; reading past the end of one goes on into the next.
+//! - h, j, k and l do what ←, ↓, ↑ and → do, on the page and in the panels; in the library,
+//!   where letters find a book, Ctrl+h, j, k and l move between the books.
 //! - Ctrl+O shows the library: every book in `~/Dropbox/Books`, by its cover. Typing narrows it
 //!   down by title, author or file name. Enter or a click
 //!   opens one; Esc goes back to the book you were reading.
+//! - With the Kobo sync set up (`kobo_link`), a book the Kobo has opens as the Kobo's copy, with
+//!   its highlights, notes and bookmarks: Ctrl+H highlights the selection, Ctrl+Shift+H adds a
+//!   note, Ctrl+D bookmarks the page, and Ctrl+I's Notes list has them all.
 //!
 //! It is always full screen. The page and the text are in the desktop's theme, and change with
 //! it; a slider moved takes that colour off the theme until "Follow theme" puts it back.
@@ -19,10 +25,17 @@
 //! `slipstream-reader BOOK.epub` opens that book, in the window already open if there is one.
 //! With no book it opens the last one, where you left it, or the library when there isn't one.
 
+mod annotations;
 mod book;
+mod book_fonts;
+mod dirs;
+mod fonts;
+mod kobo_link;
 mod library;
 mod memory;
+mod obfuscation;
 mod palette;
+mod sync;
 mod theme;
 
 use std::{
@@ -46,6 +59,8 @@ const POLICY: &str = "default-src epub:; img-src epub: data:; style-src epub: 'u
                       font-src epub: data:; media-src epub:; script-src 'none'; object-src 'none'";
 /// How much each zoom step multiplies the text by.
 const ZOOM_STEP: f64 = 1.1;
+/// How far j and k scroll the page, in CSS pixels: what an arrow key scrolls in WebKit.
+const ARROW_STEP: i32 = 40;
 /// How long the pointer stays on screen once it stops over the page.
 const POINTER_REST: Duration = Duration::from_secs(2);
 
@@ -99,6 +114,10 @@ struct Reader {
     colours_panel: gtk::Revealer,
     list: gtk::ListBox,
     zoom_label: gtk::Label,
+    /// The font to read in: the book's own, or one of the reader's.
+    font_menu: gtk::DropDown,
+    /// What the book says of its fonts.
+    book_fonts: gtk::Box,
     page_scale: gtk::Scale,
     text_scale: gtk::Scale,
     follow_theme: gtk::Button,
@@ -123,6 +142,15 @@ struct Reader {
     saving: RefCell<Option<glib::SourceId>>,
     pointer_rest: RefCell<Option<glib::SourceId>>,
     zoom_start: Cell<f64>,
+    /// The Kobo sync, when it's set up.
+    link: Option<Rc<kobo_link::Link>>,
+    notes_ui: kobo_link::NotesUi,
+    /// A sentence span to go to once the chapter being loaded has finished.
+    pending_span: RefCell<Option<String>>,
+    /// When you were last moving through this book, as the Kobo writes times.
+    read_at: RefCell<Option<String>>,
+    /// The page is being moved by you, not put somewhere by the reader.
+    user_moving: Cell<bool>,
 }
 
 impl Reader {
@@ -146,14 +174,17 @@ impl Reader {
 
         let content = webkit6::UserContentManager::new();
         content.register_script_message_handler("reader", Some(WORLD));
-        content.add_script(&webkit6::UserScript::for_world(
-            SCROLL_SCRIPT,
-            webkit6::UserContentInjectedFrames::TopFrame,
-            webkit6::UserScriptInjectionTime::End,
-            WORLD,
-            &[],
-            &[],
-        ));
+        content.register_script_message_handler("annotation", Some(WORLD));
+        for script in [SCROLL_SCRIPT, annotations::SCRIPT] {
+            content.add_script(&webkit6::UserScript::for_world(
+                script,
+                webkit6::UserContentInjectedFrames::TopFrame,
+                webkit6::UserScriptInjectionTime::End,
+                WORLD,
+                &[],
+                &[],
+            ));
+        }
 
         let settings = webkit6::Settings::new();
         // Scripts the reader runs itself still work; the book's own never do.
@@ -183,16 +214,41 @@ impl Reader {
             .width_request(320)
             .vexpand(true)
             .build();
+        // A button that looks like one, set apart from the chapters, so it isn't taken for a
+        // heading over them.
+        let library_inside = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        library_inside.append(&gtk::Image::from_icon_name("view-grid-symbolic"));
+        library_inside.append(&gtk::Label::new(Some("Library")));
         let library_button = gtk::Button::builder()
-            .label("Library")
+            .child(&library_inside)
             .css_classes(["to-library"])
+            .tooltip_text("All your books (Ctrl+O)")
             .halign(gtk::Align::Start)
-            .margin_top(20)
-            .margin_start(16)
             .build();
+        let library_bar = gtk::Box::builder().css_classes(["library-bar"]).build();
+        library_bar.append(&library_button);
+        let notes_ui = kobo_link::NotesUi::build(&view);
+        let link = kobo_link::Link::new();
+        let left_pages = gtk::Stack::builder()
+            .transition_type(gtk::StackTransitionType::Crossfade)
+            .transition_duration(120)
+            .vexpand(true)
+            .build();
+        left_pages.add_titled(&chapters_scroll, Some("contents"), "Contents");
+        left_pages.add_titled(&notes_ui.scroll, Some("notes"), "Notes");
         let chapters_column = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        chapters_column.append(&library_button);
-        chapters_column.append(&chapters_scroll);
+        chapters_column.append(&library_bar);
+        if link.is_some() {
+            let switcher = gtk::StackSwitcher::builder()
+                .stack(&left_pages)
+                .css_classes(["pages"])
+                .margin_top(12)
+                .margin_start(16)
+                .margin_end(16)
+                .build();
+            chapters_column.append(&switcher);
+        }
+        chapters_column.append(&left_pages);
         let chapters_panel = gtk::Revealer::builder()
             .child(&chapters_column)
             .transition_type(gtk::RevealerTransitionType::SlideRight)
@@ -216,6 +272,26 @@ impl Reader {
             .build();
         sliders.append(&labelled(&page_scale, "Page"));
         sliders.append(&labelled(&text_scale, "Text"));
+        let font_names: Vec<&str> = std::iter::once(fonts::BOOKS_OWN)
+            .chain(fonts::CHOICES.iter().map(|choice| choice.label))
+            .collect();
+        let font_menu = gtk::DropDown::from_strings(&font_names);
+        font_menu.set_selected(font_index(memory.font.as_deref()));
+        font_menu.add_css_class("font-menu");
+        let book_fonts = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(10)
+            .build();
+        let font_section = gtk::Box::builder()
+            .orientation(gtk::Orientation::Vertical)
+            .spacing(8)
+            .build();
+        font_section.append(&heading_label("Font"));
+        font_section.append(&font_menu);
+        let in_book = heading_label("In this book");
+        in_book.add_css_class("later");
+        font_section.append(&in_book);
+        font_section.append(&book_fonts);
         let colours = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .spacing(18)
@@ -223,10 +299,13 @@ impl Reader {
             .margin_bottom(24)
             .margin_start(20)
             .margin_end(20)
+            .width_request(260)
             .build();
+        colours.append(&font_section);
         colours.append(&sliders);
         colours.append(&follow_theme);
         colours.append(&zoom_label);
+        colours.append(&notes_ui.status);
         let colours_panel = gtk::Revealer::builder()
             .child(&colours)
             .transition_type(gtk::RevealerTransitionType::SlideLeft)
@@ -341,6 +420,8 @@ impl Reader {
             colours_panel,
             list,
             zoom_label,
+            font_menu,
+            book_fonts,
             page_scale,
             text_scale,
             follow_theme,
@@ -360,8 +441,14 @@ impl Reader {
             saving: RefCell::new(None),
             pointer_rest: RefCell::new(None),
             zoom_start: Cell::new(1.0),
+            link,
+            notes_ui,
+            pending_span: RefCell::new(None),
+            read_at: RefCell::new(None),
+            user_moving: Cell::new(false),
         });
         reader.connect();
+        reader.connect_link();
         reader.sync_sliders();
         reader.recolour();
         let weak = Rc::downgrade(&reader);
@@ -393,6 +480,12 @@ impl Reader {
             {
                 reader.memory.borrow_mut().text_choice = Some(scale.value());
                 reader.chosen();
+            }
+        });
+        let w = weak.clone();
+        self.font_menu.connect_selected_notify(move |menu| {
+            if let Some(reader) = w.upgrade() {
+                reader.font_chosen(menu.selected());
             }
         });
         let w = weak.clone();
@@ -675,7 +768,38 @@ impl Reader {
     fn library_key(self: &Rc<Self>, key: gdk::Key, plain: bool, ctrl: bool, shift: bool) -> bool {
         let typing = self.filter.has_focus() || self.filter.focus_child().is_some();
         let filtered = !self.filter.text().is_empty();
+        // The arrows, and Ctrl+h, j, k and l (the letters alone find a book), move between the
+        // books. The reader moves them itself: the shelf's own arrows only work once a click or
+        // Tab has given it a cursor, and focusing a book from here doesn't.
+        let step = match key {
+            gdk::Key::Left if plain => Some((-1, 0)),
+            gdk::Key::Right if plain => Some((1, 0)),
+            gdk::Key::Up if plain => Some((0, -1)),
+            gdk::Key::Down if plain => Some((0, 1)),
+            gdk::Key::h if ctrl => Some((-1, 0)),
+            gdk::Key::l if ctrl => Some((1, 0)),
+            gdk::Key::k if ctrl => Some((0, -1)),
+            gdk::Key::j if ctrl => Some((0, 1)),
+            _ => None,
+        };
+        if let Some((across, down)) = step {
+            if typing && down == 1 {
+                // Down from the filter to the books found.
+                self.focus_on_shelf(self.shelf_cursor().unwrap_or(0));
+                return true;
+            }
+            // In the filter, ← → ↑ are the text's.
+            if typing && !ctrl {
+                return false;
+            }
+            self.move_on_shelf(across, down);
+            return true;
+        }
         match key {
+            gdk::Key::Return | gdk::Key::KP_Enter if plain && !typing => {
+                self.open_first_found();
+                true
+            }
             gdk::Key::Escape if plain && filtered => {
                 self.filter.set_text("");
                 if let Some(first) = self.found().first() {
@@ -689,14 +813,6 @@ impl Reader {
             }
             gdk::Key::o if ctrl => {
                 self.show_book();
-                true
-            }
-            // Down from the filter to the books found.
-            gdk::Key::Down if typing => {
-                let chosen = self.shelf.selected_children().into_iter().next();
-                if let Some(child) = chosen.or_else(|| self.found().into_iter().next()) {
-                    child.grab_focus();
-                }
                 true
             }
             gdk::Key::BackSpace if plain && !typing && filtered => {
@@ -715,11 +831,65 @@ impl Reader {
                     self.filter.set_position(-1);
                     true
                 }
-                // The shelf's own arrows and Enter.
                 _ => false,
             },
             _ => false,
         }
+    }
+
+    /// Where among the books still shown the keyboard is: the focused book, or else the one
+    /// picked out.
+    fn shelf_cursor(&self) -> Option<usize> {
+        let found = self.found();
+        let focused = gtk::prelude::GtkWindowExt::focus(&self.window)
+            .and_then(|widget| widget.downcast::<gtk::FlowBoxChild>().ok());
+        focused
+            .and_then(|child| found.iter().position(|f| *f == child))
+            .or_else(|| {
+                let selected = self.shelf.selected_children();
+                found.iter().position(|f| selected.contains(f))
+            })
+    }
+
+    /// The book `at` among those shown, picked out and focused, which scrolls it into view.
+    fn focus_on_shelf(&self, at: usize) {
+        if let Some(child) = self.found().get(at) {
+            self.shelf.select_child(child);
+            child.grab_focus();
+        }
+    }
+
+    /// `across` books along and `down` rows down the shelf. Up from the top row goes to the
+    /// filter.
+    fn move_on_shelf(&self, across: i32, down: i32) {
+        let found = self.found();
+        if found.is_empty() {
+            return;
+        }
+        let Some(at) = self.shelf_cursor() else {
+            self.focus_on_shelf(0);
+            return;
+        };
+        // How many books to a row: those level with the first.
+        let top = |child: &gtk::FlowBoxChild| {
+            child
+                .compute_bounds(&self.shelf)
+                .map_or(0.0, |bounds| bounds.y())
+        };
+        let first = top(&found[0]);
+        let columns = found
+            .iter()
+            .take_while(|child| (top(child) - first).abs() < 1.0)
+            .count()
+            .max(1) as i32;
+        let target = at as i32 + across + down * columns;
+        if target < 0 && down < 0 {
+            self.filter.grab_focus();
+            self.filter.set_position(-1);
+            return;
+        }
+        // Down from a row with nothing below goes to the last book.
+        self.focus_on_shelf(target.clamp(0, found.len() as i32 - 1) as usize);
     }
 
     /// Back to the book, if there is one.
@@ -775,7 +945,9 @@ impl Reader {
 
     fn open(self: &Rc<Self>, path: &Path) {
         self.save_now();
-        let opened = match Book::open(path) {
+        // The Kobo's KEPUB of this book, when the sync has it.
+        let file = self.file_to_open(path);
+        let opened = match Book::open(&file) {
             Ok(book) => Rc::new(book),
             Err(err) => {
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -785,6 +957,7 @@ impl Reader {
         };
         self.window.set_title(Some(&opened.title));
         self.fill_chapters(&opened);
+        self.show_book_fonts(&opened);
         *self.book.borrow_mut() = Some(opened.clone());
         *self.path.borrow_mut() = Some(path.to_path_buf());
         let place = {
@@ -793,10 +966,14 @@ impl Reader {
             memory.place(path).unwrap_or_default()
         };
         let chapter = place.chapter.min(opened.chapters.len() - 1);
+        self.read_at.replace(place.read_at.clone());
+        self.user_moving.set(false);
+        self.pending_span.replace(None);
         self.stack.set_visible_child_name("book");
         self.view.grab_focus();
         self.load_chapter(chapter, Some(place.fraction));
         self.save_soon();
+        self.after_open(path);
     }
 
     fn fill_chapters(&self, book: &Book) {
@@ -819,6 +996,101 @@ impl Reader {
         }
     }
 
+    /// What the book says of its fonts: each it names, whether it carries it, in what format,
+    /// and for those it doesn't, whether this computer has it.
+    fn show_book_fonts(&self, book: &Book) {
+        while let Some(child) = self.book_fonts.first_child() {
+            self.book_fonts.remove(&child);
+        }
+        let report = &book.fonts;
+        let installed: Vec<String> = self
+            .window
+            .pango_context()
+            .list_families()
+            .iter()
+            .map(|family| family.name().to_lowercase())
+            .collect();
+        let body_key = report.body.as_ref().map(|name| name.to_lowercase());
+        if let Some(body) = &report.body
+            && book_fonts::is_generic(body)
+        {
+            self.book_fonts.append(&font_row(
+                "No font named",
+                &format!("Body text asks only for {body}"),
+            ));
+        }
+        if report.families.is_empty() && report.body.is_none() {
+            self.book_fonts.append(&font_row(
+                "No font named",
+                "The book leaves the font to the reader",
+            ));
+        }
+        const SHOWN: usize = 6;
+        for family in report.families.iter().take(SHOWN) {
+            let key = family.name.to_lowercase();
+            let mut parts: Vec<String> = Vec::new();
+            if Some(&key) == body_key.as_ref() {
+                parts.push("Body text".to_string());
+            }
+            if family.embedded() {
+                let formats: Vec<&str> = family.formats().iter().map(|f| f.name()).collect();
+                let styles = match family.faces.len() {
+                    1 => "1 style".to_string(),
+                    n => format!("{n} styles"),
+                };
+                parts.push(format!("Embedded, {} · {styles}", formats.join(" + ")));
+                if let Some(scheme) = family.obfuscation() {
+                    parts.push(format!("obfuscated ({})", scheme.name()));
+                }
+            } else {
+                parts.push("Not embedded".to_string());
+                if family.missing > 0 {
+                    parts.push("its file is missing".to_string());
+                }
+                parts.push(if installed.contains(&key) {
+                    "installed here".to_string()
+                } else {
+                    "not installed, so another is used".to_string()
+                });
+            }
+            self.book_fonts
+                .append(&font_row(&family.name, &parts.join(" · ")));
+        }
+        if report.families.len() > SHOWN {
+            let more = report.families.len() - SHOWN;
+            self.book_fonts.append(
+                &gtk::Label::builder()
+                    .label(format!("and {more} more"))
+                    .xalign(0.0)
+                    .css_classes(["caption"])
+                    .build(),
+            );
+        }
+    }
+
+    /// The font picked from the menu: the page set in it at once, at the same place.
+    fn font_chosen(&self, index: u32) {
+        let key = index
+            .checked_sub(1)
+            .and_then(|at| fonts::CHOICES.get(at as usize))
+            .map(|choice| choice.key.to_string());
+        if self.memory.borrow().font == key {
+            return;
+        }
+        self.memory.borrow_mut().font = key;
+        let fraction = self.fraction.get();
+        self.recolour();
+        let view = self.view.clone();
+        glib::timeout_add_local_once(Duration::from_millis(120), move || {
+            if let Some(reader) = READER.with(|reader| reader.borrow().clone())
+                && reader.view == view
+            {
+                reader.scroll_to(fraction);
+            }
+        });
+        self.save_soon();
+    }
+
     // Moving through the book.
 
     /// Loads chapter `index`, and once it's in, scrolls to `fraction` of the way down it.
@@ -839,6 +1111,7 @@ impl Reader {
         let Some(book) = self.book.borrow().clone() else {
             return;
         };
+        self.user_moving.set(true);
         let Some(entry) = book.contents.get(index) else {
             return;
         };
@@ -911,9 +1184,13 @@ impl Reader {
                 self.at_bottom.set(false);
             }
             webkit6::LoadEvent::Finished => {
-                if let Some(fraction) = self.pending.take() {
+                let fraction = self.pending.take();
+                if let Some(span) = self.pending_span.take() {
+                    self.scroll_to_span(&span);
+                } else if let Some(fraction) = fraction {
                     self.scroll_to(fraction);
                 }
+                self.redraw_marks();
             }
             _ => {}
         }
@@ -932,6 +1209,9 @@ impl Reader {
         self.fraction.set(fraction.clamp(0.0, 1.0));
         self.at_top.set(top);
         self.at_bottom.set(bottom);
+        if self.user_moving.get() {
+            self.place_moved();
+        }
         self.save_soon();
     }
 
@@ -989,20 +1269,35 @@ impl Reader {
         if self.in_library() {
             return self.library_key(key, plain, ctrl, shift);
         }
-        if state.contains(gdk::ModifierType::SUPER_MASK) && key.to_lower() == gdk::Key::i {
+        // Ctrl+I, not Super+I: Windows keeps the Windows key for itself, so this works under WSL
+        // too. Not while a note is being written.
+        if ctrl && key.to_lower() == gdk::Key::i && !self.notes_ui.popover.is_visible() {
             self.toggle_panels();
+            return true;
+        }
+        let ctrl_shift = state == gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+        if ctrl_shift && key.to_lower() == gdk::Key::h {
+            self.highlight_selection(true);
             return true;
         }
         if ctrl {
             match key {
+                gdk::Key::h => self.highlight_selection(false),
+                gdk::Key::d => self.toggle_bookmark(),
                 gdk::Key::plus | gdk::Key::equal | gdk::Key::KP_Add => self.zoom_by(ZOOM_STEP),
                 gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract => {
                     self.zoom_by(1.0 / ZOOM_STEP)
                 }
                 gdk::Key::_0 | gdk::Key::KP_0 => self.zoom_to(1.0),
                 gdk::Key::o => self.show_library(),
-                gdk::Key::Page_Down => self.step_chapter(true),
-                gdk::Key::Page_Up => self.step_chapter(false),
+                gdk::Key::Page_Down => {
+                    self.user_moving.set(true);
+                    self.step_chapter(true)
+                }
+                gdk::Key::Page_Up => {
+                    self.user_moving.set(true);
+                    self.step_chapter(false)
+                }
                 _ => return false,
             }
             return true;
@@ -1017,11 +1312,20 @@ impl Reader {
             focus == *self.view.upcast_ref::<gtk::Widget>() || focus.is_ancestor(&self.view)
         });
         if !on_page {
-            return false;
+            return plain && self.vim_in_panel(key);
         }
+        // Anything from here on moves through the book, or the page itself moves.
+        self.user_moving.set(true);
         match key {
-            gdk::Key::Left if plain => self.step_chapter(false),
-            gdk::Key::Right if plain => self.step_chapter(true),
+            gdk::Key::Left | gdk::Key::h if plain => self.step_chapter(false),
+            gdk::Key::Right | gdk::Key::l if plain => self.step_chapter(true),
+            // j and k scroll as ↓ and ↑ do, and carry on into the next chapter or the one before.
+            gdk::Key::j if plain && self.at_bottom.get() => self.step_chapter(true),
+            gdk::Key::k if plain && self.at_top.get() && self.chapter.get() > 0 => {
+                self.step_chapter(false)
+            }
+            gdk::Key::j if plain => self.scroll_by_lines(1),
+            gdk::Key::k if plain => self.scroll_by_lines(-1),
             // Reading on past the end of a chapter, or back past its start.
             gdk::Key::space | gdk::Key::Page_Down | gdk::Key::Down | gdk::Key::KP_Page_Down
                 if plain && self.at_bottom.get() =>
@@ -1037,6 +1341,40 @@ impl Reader {
             _ => return false,
         }
         true
+    }
+
+    /// h, j, k and l where the arrows would go, in the panels: up and down the chapter list, and
+    /// along the colour sliders. Whether it was one of them.
+    fn vim_in_panel(&self, key: gdk::Key) -> bool {
+        let Some(focus) = gtk::prelude::GtkWindowExt::focus(&self.window) else {
+            return false;
+        };
+        let Some((step, count)) = vim_move(key) else {
+            return false;
+        };
+        if focus.is_ancestor(&self.list) {
+            if step == gtk::MovementStep::DisplayLines {
+                self.list.emit_move_cursor(step, count, false, false);
+            }
+            return true;
+        }
+        if let Some(range) = focus.downcast_ref::<gtk::Range>() {
+            range.emit_move_slider(match key {
+                gdk::Key::h => gtk::ScrollType::StepLeft,
+                gdk::Key::j => gtk::ScrollType::StepDown,
+                gdk::Key::k => gtk::ScrollType::StepUp,
+                _ => gtk::ScrollType::StepRight,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// The page scrolled `lines` arrow-key steps down, or up when negative.
+    fn scroll_by_lines(&self, lines: i32) {
+        let script = format!("window.scrollBy(0, {})", lines * ARROW_STEP);
+        self.view
+            .evaluate_javascript(&script, Some(WORLD), None, gio::Cancellable::NONE, |_| {});
     }
 
     fn toggle_panels(&self) {
@@ -1136,9 +1474,17 @@ impl Reader {
         )
     }
 
-    /// The page, its text and the panels in the two colours.
+    /// The page, its text and the panels in the two colours, and the text in the font chosen.
     fn recolour(&self) {
         let (page, text) = self.colours();
+        let font = self
+            .memory
+            .borrow()
+            .font
+            .as_deref()
+            .and_then(fonts::choice)
+            .map(fonts::css)
+            .unwrap_or_default();
         {
             let memory = self.memory.borrow();
             self.follow_theme
@@ -1146,7 +1492,7 @@ impl Reader {
         }
         self.content.remove_all_style_sheets();
         self.content.add_style_sheet(&webkit6::UserStyleSheet::new(
-            &page_css(page, text),
+            &format!("{}{font}", page_css(page, text, self.theme.get().accent)),
             webkit6::UserContentInjectedFrames::AllFrames,
             webkit6::UserStyleLevel::User,
             &[],
@@ -1225,6 +1571,7 @@ impl Reader {
                 Place {
                     chapter: self.chapter.get(),
                     fraction: self.fraction.get(),
+                    read_at: self.read_at.borrow().clone(),
                 },
             );
         }
@@ -1435,6 +1782,17 @@ fn well_formed(bytes: &[u8]) -> bool {
     }
 }
 
+/// What h, j, k and l move by, as ←, ↓, ↑ and → would.
+fn vim_move(key: gdk::Key) -> Option<(gtk::MovementStep, i32)> {
+    match key {
+        gdk::Key::h => Some((gtk::MovementStep::VisualPositions, -1)),
+        gdk::Key::j => Some((gtk::MovementStep::DisplayLines, 1)),
+        gdk::Key::k => Some((gtk::MovementStep::DisplayLines, -1)),
+        gdk::Key::l => Some((gtk::MovementStep::VisualPositions, 1)),
+        _ => None,
+    }
+}
+
 /// A vertical slider along the run of colours, light at the top.
 fn colour_scale(name: &str) -> gtk::Scale {
     let scale = gtk::Scale::with_range(gtk::Orientation::Vertical, 0.0, 1.0, 0.01);
@@ -1444,6 +1802,45 @@ fn colour_scale(name: &str) -> gtk::Scale {
     scale.add_css_class("colour");
     scale.add_css_class(name);
     scale
+}
+
+/// Where `key` is in the font menu: 0 for the book's own.
+fn font_index(key: Option<&str>) -> u32 {
+    key.and_then(|key| fonts::CHOICES.iter().position(|choice| choice.key == key))
+        .map_or(0, |at| at as u32 + 1)
+}
+
+/// A small heading over a part of the panel.
+fn heading_label(text: &str) -> gtk::Label {
+    gtk::Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .css_classes(["heading"])
+        .build()
+}
+
+/// One of the book's fonts: its name, and what's known of it beneath.
+fn font_row(name: &str, detail: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    row.append(
+        &gtk::Label::builder()
+            .label(name)
+            .xalign(0.0)
+            .wrap(true)
+            .max_width_chars(26)
+            .css_classes(["font-name"])
+            .build(),
+    );
+    row.append(
+        &gtk::Label::builder()
+            .label(detail)
+            .xalign(0.0)
+            .wrap(true)
+            .max_width_chars(26)
+            .css_classes(["caption"])
+            .build(),
+    );
+    row
 }
 
 fn labelled(scale: &gtk::Scale, label: &str) -> gtk::Box {
@@ -1460,11 +1857,13 @@ fn labelled(scale: &gtk::Scale, label: &str) -> gtk::Box {
 
 /// The book in the two colours, set as the reader's own stylesheet, which wins over the book's.
 /// The text keeps to a column of a comfortable width, which grows with the zoom.
-fn page_css(page: palette::Rgb, text: palette::Rgb) -> String {
+fn page_css(page: palette::Rgb, text: palette::Rgb, accent: palette::Rgb) -> String {
     let page_hex = palette::hex(page);
     let text_hex = palette::hex(text);
     let faint = palette::rgba(text, 0.35);
     let selection = palette::rgba(text, 0.22);
+    let mark = palette::rgba(accent, 0.32);
+    let accent_hex = palette::hex(accent);
     format!(
         "html {{ background: {page_hex} !important; scrollbar-width: none !important; }}
 ::-webkit-scrollbar {{ display: none !important; }}
@@ -1475,7 +1874,10 @@ body * {{ color: inherit !important; background-color: transparent !important;
   border-color: {faint} !important; }}
 a, a * {{ color: {text_hex} !important; text-decoration-color: {faint} !important; }}
 img, svg, video {{ max-width: 100% !important; height: auto !important; }}
-::selection {{ background: {selection} !important; }}"
+::selection {{ background: {selection} !important; }}
+::highlight(slipstream-mark) {{ background-color: {mark}; }}
+::highlight(slipstream-note) {{ background-color: {mark}; text-decoration: underline;
+  text-decoration-color: {accent_hex}; text-decoration-thickness: 2px; }}"
     )
 }
 
@@ -1506,9 +1908,10 @@ fn chrome_css(page: palette::Rgb, text: palette::Rgb, accent: palette::Rgb) -> S
 .book-author {{ color: {quiet}; font-size: 0.9em; }}
 entry.filter {{ background: {panel}; color: {text_hex}; border: 1px solid {edge}; box-shadow: none; }}
 entry.filter:focus-within {{ border-color: {accent_hex}; outline-color: {accent_hex}; }}
-button.to-library {{ background: none; border: none; box-shadow: none; color: {quiet};
-  padding: 4px 8px; }}
-button.to-library:hover {{ color: {text_hex}; background: {hover}; }}
+.library-bar {{ padding: 16px; border-bottom: 1px solid {edge}; }}
+button.to-library {{ background: {chosen}; color: {text_hex}; border: 1px solid {edge};
+  box-shadow: none; padding: 6px 14px; font-weight: 600; }}
+button.to-library:hover {{ background: {hover}; border-color: {accent_hex}; }}
 .panel > * {{ background: {panel}; color: {text_hex}; }}
 .panel.left > * {{ border-right: 1px solid {edge}; }}
 .panel.right > * {{ border-left: 1px solid {edge}; }}
@@ -1528,7 +1931,24 @@ scale.colour slider {{ min-width: 26px; min-height: 26px; border-radius: 13px;
   border: 2px solid {text_hex}; box-shadow: 0 0 0 2px {page_hex}; }}
 scale.page slider {{ background: {page_hex}; }}
 scale.text slider {{ background: {text_hex}; border-color: {page_hex}; box-shadow: 0 0 0 2px {text_hex}; }}
-.caption, .zoom {{ color: {quiet}; font-size: 0.9em; }}"
+.caption, .zoom {{ color: {quiet}; font-size: 0.9em; }}
+.heading {{ color: {quiet}; font-size: 0.8em; font-weight: 600; letter-spacing: 0.08em; }}
+.heading.later {{ margin-top: 10px; }}
+.font-name {{ font-weight: 600; }}
+dropdown.font-menu > button {{ background: {hover}; color: {text_hex}; border: 1px solid {edge};
+  box-shadow: none; }}
+dropdown.font-menu > button:hover {{ background: {chosen}; }}
+popover > contents {{ background: {panel}; color: {text_hex}; border: 1px solid {edge}; }}
+popover listview row:hover, popover listview row:selected {{ background: {chosen}; }}
+stackswitcher.pages button {{ background: none; border: 1px solid {edge}; box-shadow: none;
+  color: {quiet}; padding: 4px 14px; }}
+stackswitcher.pages button:checked {{ background: {chosen}; color: {text_hex}; border-color: {accent_hex}; }}
+.notes row {{ border-bottom: 1px solid {edge}; }}
+.notes row:hover {{ background: {hover}; }}
+.quote {{ color: {text_hex}; }}
+.note-said {{ color: {accent_hex}; font-style: italic; }}
+textview.note-text, textview.note-text text {{ background: {page_hex}; color: {text_hex}; }}
+textview.note-text {{ border: 1px solid {edge}; padding: 6px; }}"
     )
 }
 

@@ -1,5 +1,5 @@
 //! What the reader remembers between runs: the last book, where you were in every book, how big
-//! the text is, the two colours, and whether the side panels were out. Kept as JSON in
+//! the text is, the two colours, the font, and whether the side panels were out. Kept as JSON in
 //! `~/.local/state/slipstream/reader.json`.
 
 use std::{
@@ -23,15 +23,21 @@ pub struct Memory {
     pub page_choice: Option<f64>,
     pub text_choice: Option<f64>,
     pub panels: bool,
+    /// The reader's font the book is set in (`fonts::Choice::key`), or `None` for the book's own.
+    pub font: Option<String>,
     /// Where you were in each book, by its path.
     pub places: BTreeMap<String, Place>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct Place {
     pub chapter: usize,
     /// How far down the chapter, from 0 at its top to 1 at its end.
     pub fraction: f64,
+    /// When you were last there, as the Kobo writes times: whichever of here and the Kobo is
+    /// later wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<String>,
 }
 
 impl Default for Memory {
@@ -42,6 +48,7 @@ impl Default for Memory {
             page_choice: None,
             text_choice: None,
             panels: false,
+            font: None,
             places: BTreeMap::new(),
         }
     }
@@ -69,7 +76,7 @@ impl Memory {
     }
 
     pub fn place(&self, book: &Path) -> Option<Place> {
-        self.places.get(&key(book)).copied()
+        self.places.get(&key(book)).cloned()
     }
 
     pub fn set_place(&mut self, book: &Path, place: Place) {
@@ -102,7 +109,7 @@ impl Memory {
 }
 
 pub fn path() -> PathBuf {
-    slipstream_config::screens::state_dir().join("reader.json")
+    crate::dirs::state_dir().join("reader.json")
 }
 
 fn key(book: &Path) -> String {
@@ -141,6 +148,7 @@ mod tests {
             Place {
                 chapter: 3,
                 fraction: 0.25,
+                read_at: None,
             },
         );
         memory.write(&path).unwrap();

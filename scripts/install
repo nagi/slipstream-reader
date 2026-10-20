@@ -1,0 +1,32 @@
+#!/bin/sh
+# Builds the reader and installs it for you alone, in ~/.local: the program in ~/.local/bin and
+# its entry in ~/.local/share/applications, so app launchers (and, under WSL, the Windows Start
+# menu) list it and file managers offer it for EPUBs. Slipstream's Super+R finds it there too.
+#
+#   scripts/install
+#
+# Each file is copied beside its destination and then moved into place, so a reader that's open
+# keeps running until it's closed.
+set -eu
+repo=$(cd "$(dirname "$0")/.." && pwd -P)
+cd "$repo"
+cargo build --release
+bin=$HOME/.local/bin
+apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+mkdir -p "$bin" "$apps"
+put() {
+    cp "$2" "$3.new"
+    chmod "$1" "$3.new"
+    mv -f "$3.new" "$3"
+}
+put 755 target/release/slipstream-reader "$bin/slipstream-reader"
+entry=io.github.peterwalker78.SlipstreamReader.desktop
+# By its full path: a launcher's PATH (WSL's Start menu, for one) may not have ~/.local/bin.
+sed "s#^Exec=slipstream-reader#Exec=$bin/slipstream-reader#" "$entry" >"$repo/target/$entry"
+put 644 "$repo/target/$entry" "$apps/$entry"
+update-desktop-database "$apps" 2>/dev/null || true
+echo "Installed $bin/slipstream-reader."
+case ":$PATH:" in
+    *":$bin:"*) ;;
+    *) echo "$bin isn't on your PATH: add it, or start the reader as $bin/slipstream-reader." ;;
+esac

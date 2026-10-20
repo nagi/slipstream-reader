@@ -1,18 +1,21 @@
 [package]
 name = "slipstream-reader"
-description = "Slipstream's reading mode: EPUB books, full screen and distraction free"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-# gtk4-rs 0.11 needs a newer Rust than the compositor does.
+description = "A reading mode for EPUB books: full screen and distraction free, in step with a Kobo"
+version = "0.14.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+# gtk4-rs 0.11 needs a recent Rust.
 rust-version = "1.92"
 
 [dependencies]
-gtk4.workspace = true
+# GTK 4.14 and WebKitGTK 6 (2.42 or newer): Ubuntu 24.04, Fedora 40, Arch.
+gtk4 = { version = "0.11", features = ["v4_14"] }
 webkit6 = { version = "0.6", features = ["v2_42"] }
 rbook = { version = "0.7", default-features = false, features = ["prelude"] }
-serde.workspace = true
-serde_json.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 quick-xml = "0.41"
-slipstream-config.workspace = true
+
+[profile.release]
+lto = "thin"
+strip = true
